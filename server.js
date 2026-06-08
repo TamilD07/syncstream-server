@@ -1,46 +1,58 @@
 const http = require("http");
-const { Server } = require("socket.io");
+const { WebSocketServer } = require("ws");
 
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("SyncStream signaling server is running");
 });
 
-const io = new Server(httpServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
-});
-
+const wss = new WebSocketServer({ server: httpServer });
 const rooms = {};
 
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+function broadcast(roomId, senderId, data) {
+  const room = rooms[roomId];
+  if (!room) return;
+  const message = JSON.stringify(data);
+  room.forEach((client) => {
+    if (client.id !== senderId && client.ws.readyState === 1) {
+      client.ws.send(message);
+    }
+  });
+}
 
-  socket.on("room:join", ({ room, role }) => {
-    socket.join(room);
-    socket.data.room = room;
-    if (!rooms[room]) rooms[room] = { hostPosition: 0, state: "paused" };
-    socket.to(room).emit("peer:joined", { id: socket.id, role });
-    socket.emit("room:state", rooms[room]);
-    console.log(`${role} joined room ${room}`);
+wss.on("connection", (ws) => {
+  ws.id = Math.random().toString(36).slice(2);
+  ws.roomId = null;
+  console.log("Connected:", ws.id);
+
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      const { type, room } = msg;
+
+      if (type === "room:join") {
+        ws.roomId = room;
+        if (!rooms[room]) rooms[room] = [];
+        rooms[room].push({ id: ws.id, ws });
+        broadcast(room, ws.id, { type: "peer:joined", id: ws.id, role: msg.role });
+        ws.send(JSON.stringify({ type: "room:state", state: { hostPosition: 0, playState: "paused" } }));
+        console.log(`${msg.role} joined room ${room}`);
+      } else {
+        broadcast(room, ws.id, msg);
+      }
+    } catch (e) {
+      console.error("Parse error:", e);
+    }
   });
 
-  socket.on("sync:state", (data) => {
-    if (rooms[data.room]) rooms[data.room] = { ...rooms[data.room], ...data };
-    socket.to(data.room).emit("sync:state", data);
-  });
-
-  socket.on("sync:seek", (data) => socket.to(data.room).emit("sync:seek", data));
-  socket.on("sync:buffered", (data) => socket.to(data.room).emit("sync:buffered", data));
-  socket.on("chat:message", (data) => socket.to(data.room).emit("chat:message", data));
-  socket.on("webrtc:offer", (data) => socket.to(data.room).emit("webrtc:offer", data));
-  socket.on("webrtc:answer", (data) => socket.to(data.room).emit("webrtc:answer", data));
-  socket.on("webrtc:ice", (data) => socket.to(data.room).emit("webrtc:ice", data));
-  socket.on("media:change", (data) => socket.to(data.room).emit("media:change", data));
-
-  socket.on("disconnect", () => {
-    const room = socket.data.room;
-    if (room) socket.to(room).emit("host:disconnect", { id: socket.id });
-    console.log("Client disconnected:", socket.id);
+  ws.on("close", () => {
+    const room = ws.roomId;
+    if (room && rooms[room]) {
+      rooms[room] = rooms[room].filter((c) => c.id !== ws.id);
+      broadcast(room, ws.id, { type: "host:disconnect", id: ws.id });
+      if (rooms[room].length === 0) delete rooms[room];
+    }
+    console.log("Disconnected:", ws.id);
   });
 });
 
